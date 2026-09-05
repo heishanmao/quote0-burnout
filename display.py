@@ -173,11 +173,12 @@ def get_codex_usage(retries: int = 4, delay: float = 3.0):
 def get_today_codex_tokens() -> dict | None:
     """Compute today's Codex token usage from local session JSONL files.
 
-    For each of today's session files, read the cumulative ``total_token_usage``
-    that Codex/OpenAI tracks per session and take (last − first) as that
-    session's usage, then sum across all of today's sessions. This is the
-    authoritative total (the JSONL ``last_token_usage`` field is only the
-    per-turn delta and is less robust to parse).
+    ``total_token_usage`` is cumulative per rollout but can RESET mid-session
+    (a new thread starts over from the context base), so difference-vs-first
+    breaks. Instead we sum the positive deltas between consecutive
+    ``token_count`` events, attributing each event's increment to the day of
+    the later event. The very first ``token_count`` event of a file that
+    occurs today is counted in full (the session started today).
 
     Timestamps are compared (UTC) against local-day bounds so cross-midnight
     and timezone offsets are handled correctly.
@@ -209,8 +210,7 @@ def get_today_codex_tokens() -> dict | None:
                 if not day_dir.is_dir() or not day_dir.name.isdigit():
                     continue
                 for fpath in sorted(day_dir.glob("*.jsonl")):
-                    first_tv = None
-                    last_tv = None
+                    prev_tv = None
                     try:
                         for line in fpath.read_text(encoding="utf-8").splitlines():
                             line = line.strip()
@@ -228,22 +228,29 @@ def get_today_codex_tokens() -> dict | None:
                                 ts_unix = ts_dt.timestamp()
                             except Exception:
                                 continue
-                            if not (utc_today_start <= ts_unix < utc_today_end):
+                            p = obj.get("payload") or {}
+                            if obj.get("type") != "event_msg" or p.get("type") != "token_count":
                                 continue
-                            p = obj.get("payload", {})
-                            if obj.get("type") == "event_msg" and p.get("type") == "token_count":
-                                tv = p.get("info", {}).get("total_token_usage")
-                                if tv:
-                                    last_tv = tv
-                                    if first_tv is None:
-                                        first_tv = tv
+                            tv = (p.get("info") or {}).get("total_token_usage")
+                            if not tv:
+                                continue
+                            in_today = utc_today_start <= ts_unix < utc_today_end
+                            if prev_tv is None:
+                                # First token event of this file. Only counts
+                                # toward today if it happened today.
+                                if in_today:
+                                    for k in KEYS:
+                                        totals[k] += tv.get(k, 0)
+                                    seen_sessions.add(fpath.stem)
+                            elif in_today:
+                                for k in KEYS:
+                                    delta = tv.get(k, 0) - prev_tv.get(k, 0)
+                                    if delta > 0:
+                                        totals[k] += delta
+                                seen_sessions.add(fpath.stem)
+                            prev_tv = tv
                     except Exception:
                         continue
-
-                    if first_tv and last_tv:
-                        for k in KEYS:
-                            totals[k] += last_tv.get(k, 0) - first_tv.get(k, 0)
-                        seen_sessions.add(fpath.stem)
 
     totals["sessions"] = len(seen_sessions)
     return totals if totals["sessions"] > 0 else None
@@ -468,15 +475,16 @@ def build_codex_snapshot(codex: dict) -> dict:
         result["today_sessions"] = today_tokens["sessions"]
         # Estimate cost at GPT-5.6 Sol rates (user-specified model):
         # input $5/M, cached input $0.50/M, output $30/M.
+        # input_tokens already includes cached_input_tokens, and
+        # output_tokens already includes reasoning_output_tokens.
         in_tok  = today_tokens["input_tokens"]
         cached  = today_tokens["cached_input_tokens"]
         out_tok = today_tokens["output_tokens"]
-        reason  = today_tokens["reasoning_output_tokens"]
         p = _CODEX_PRICE
         result["today_cost"] = (
             (in_tok - cached) / 1e6 * p["input"]
             + cached / 1e6 * p["cached"]
-            + (out_tok + reason) / 1e6 * p["output"]
+            + out_tok / 1e6 * p["output"]
         )
         result["today_cost_source"] = "est"
 
